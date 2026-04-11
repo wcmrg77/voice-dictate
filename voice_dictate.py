@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 """
 Voice Dictate
 Shortcut: Ctrl + Shift (hold → release to transcribe)
@@ -30,12 +30,29 @@ import sounddevice as sd
 import pyperclip
 from pynput import keyboard
 
+try:
+    from AppKit import (
+        NSApplication,
+        NSApplicationActivationPolicyAccessory,
+        NSApplicationActivateIgnoringOtherApps,
+        NSRunningApplication,
+        NSWorkspace,
+    )
+    HAS_APPKIT = True
+except ImportError:
+    HAS_APPKIT = False
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
 ENV_PATH = Path(__file__).parent / ".env"
+
+# Post-processing (LLM reformatting of the raw transcript)
+FORMAT_ENABLED = True
+FORMAT_MODEL   = "ministral-3b-latest"
+FORMAT_TIMEOUT = 2.0   # seconds; fall back to raw text if exceeded
 
 
 # ── .env ──────────────────────────────────────────────────────────────────────
@@ -60,7 +77,39 @@ lock = threading.Lock()
 shift_down = False
 ctrl_down = False
 first_paste = True          # first transcription gets no leading space
+target_pid: int = 0         # app that was frontmost when recording started
+current_level: float = 0.0  # latest RMS volume from the mic (0..~0.3)
+level_lock = threading.Lock()
 ui_queue: queue.Queue = queue.Queue()
+
+
+# ── macOS focus helpers ──────────────────────────────────────────────────────
+
+def hide_from_dock():
+    """Make Python an accessory app (no dock icon, no Cmd-Tab entry)."""
+    if HAS_APPKIT:
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+
+
+def capture_frontmost_pid():
+    """Remember which app was frontmost right before we show the widget."""
+    global target_pid
+    if not HAS_APPKIT:
+        target_pid = 0
+        return
+    app = NSWorkspace.sharedWorkspace().frontmostApplication()
+    target_pid = app.processIdentifier() if app else 0
+
+
+def activate_target_app():
+    """Bring the captured app back to the front so Cmd-V lands there."""
+    if not HAS_APPKIT or not target_pid:
+        return
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(target_pid)
+    if app:
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
 
 
 # ── Transcription ─────────────────────────────────────────────────────────────
@@ -106,16 +155,142 @@ def transcribe_audio(audio_path: Path) -> str:
         return ""
 
 
+# ── Formatting ────────────────────────────────────────────────────────────────
+
+FORMAT_SYSTEM_PROMPT = """Du bist ein Formatierungs-Assistent für Diktate.
+
+Deine einzige Aufgabe: füge sinnvolle Absätze und Zeilenumbrüche ein, \
+wenn der diktierte Text eine Nachricht oder E-Mail ist \
+(erkennbar an Anrede wie "Hi", "Hallo", "Sehr geehrte", "Liebe/r", "Guten Tag", "Moin", \
+und/oder Verabschiedung wie "Viele Grüße", "Liebe Grüße", "MfG", "Mit freundlichen Grüßen", \
+"Beste Grüße", "Cheers", "Best", "Regards").
+
+Strikte Regeln — Verstöße sind nicht erlaubt:
+- Du darfst NUR Whitespace verändern (Leerzeichen, Zeilenumbrüche).
+- Ändere KEIN Wort, KEINEN Buchstaben, KEIN Komma, KEINEN Punkt.
+- Korrigiere KEINE Grammatik, Rechtschreibung oder Zeichensetzung.
+- Übersetze NICHT.
+- Wenn der Text keine Nachricht/E-Mail ist (Notiz, Stichpunkt, Gedanke, Frage, Code, …), \
+gib ihn exakt unverändert zurück.
+- Gib NUR den formatierten Text zurück — keine Erklärungen, keine Anführungszeichen, kein Präfix."""
+
+# Few-shot examples baked into the request. Covers: formal DE email (no
+# trailing punct on name), casual DE email with trailing period on signature,
+# pure DE note (must stay unchanged), EN email with comma-separated sign-off.
+_FORMAT_FEWSHOT = [
+    ("Hallo Max, wie geht es dir? Ich wollte kurz Bescheid geben, "
+     "dass das Meeting morgen um 10 Uhr stattfindet. Viele Grüße Gregor",
+     "Hallo Max,\n\nwie geht es dir? Ich wollte kurz Bescheid geben, "
+     "dass das Meeting morgen um 10 Uhr stattfindet.\n\nViele Grüße\nGregor"),
+    ("Hi Vincent, wollte mal fragen, wie es dir so geht. Danke für die "
+     "Nachricht und ich melde mich die nächsten Tage. Beste Grüße, Gregor.",
+     "Hi Vincent,\n\nwollte mal fragen, wie es dir so geht. Danke für die "
+     "Nachricht und ich melde mich die nächsten Tage.\n\nBeste Grüße,\nGregor."),
+    ("das ist nur eine kurze notiz, nichts besonderes.",
+     "das ist nur eine kurze notiz, nichts besonderes."),
+    ("Hi Sarah, just a quick heads-up that the deploy is done and everything "
+     "looks green on staging. Let me know if you see anything weird. Cheers, Sarah.",
+     "Hi Sarah,\n\njust a quick heads-up that the deploy is done and everything "
+     "looks green on staging. Let me know if you see anything weird.\n\nCheers,\nSarah."),
+]
+
+
+def _strip_ws(s: str) -> str:
+    """Collapse to non-whitespace characters for the sanity check."""
+    return "".join(s.split())
+
+
+_TRAIL_PUNCT = set(".!?,;:")
+
+
+def _reattach_trailing_punct(raw: str, formatted: str) -> str | None:
+    """
+    If `formatted` is `raw` missing ONLY trailing punctuation at the very end
+    (e.g. the LLM dropped the final "." from "Gregor."), return a patched
+    version with that punctuation re-appended. Otherwise return None.
+    """
+    raw_ws = _strip_ws(raw)
+    fmt_ws = _strip_ws(formatted)
+    if not raw_ws.startswith(fmt_ws) or raw_ws == fmt_ws:
+        return None
+    missing = raw_ws[len(fmt_ws):]
+    if not all(c in _TRAIL_PUNCT for c in missing):
+        return None
+    return formatted.rstrip() + missing
+
+
+def format_transcript(raw: str) -> str:
+    """Ask Mistral to add paragraph structure; fall back to raw on any issue."""
+    if not FORMAT_ENABLED or not raw.strip():
+        return raw
+
+    messages = [{"role": "system", "content": FORMAT_SYSTEM_PROMPT}]
+    for user_msg, assistant_msg in _FORMAT_FEWSHOT:
+        messages.append({"role": "user", "content": user_msg})
+        messages.append({"role": "assistant", "content": assistant_msg})
+    messages.append({"role": "user", "content": raw})
+
+    body = json.dumps({
+        "model": FORMAT_MODEL,
+        "temperature": 0.0,
+        "max_tokens": 800,
+        "messages": messages,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.mistral.ai/v1/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=FORMAT_TIMEOUT) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        formatted = result["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"⚠️  format skipped ({e}) — using raw", file=sys.stderr)
+        return raw
+
+    # Safety net: non-whitespace characters must match exactly.
+    # Tolerated exception: the LLM dropped trailing punctuation at the very
+    # end (common failure mode on name signatures) — we just glue it back.
+    if _strip_ws(formatted) == _strip_ws(raw):
+        return formatted
+
+    patched = _reattach_trailing_punct(raw, formatted)
+    if patched is not None:
+        return patched
+
+    print("⚠️  format changed non-whitespace — using raw", file=sys.stderr)
+    return raw
+
+
 # ── Paste ─────────────────────────────────────────────────────────────────────
 
 def paste_text(text: str):
     global first_paste
-    if not first_paste:
-        text = " " + text
+    needs_space = not first_paste
     first_paste = False
 
+    # Clipboard always holds the clean text, so manual pastes into the
+    # correct field work too — no leading-space artifact.
     pyperclip.copy(text)
+    activate_target_app()   # return focus to the app the user was in
     time.sleep(0.15)
+
+    if needs_space:
+        # Separator between consecutive dictations is typed, not clipboarded.
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to keystroke " "'],
+            check=False,
+            stderr=subprocess.DEVNULL,
+        )
+
     subprocess.run(
         ["osascript", "-e",
          'tell application "System Events" to keystroke "v" using {command down}'],
@@ -131,6 +306,7 @@ def start_recording():
     with lock:
         if recording:
             return
+        capture_frontmost_pid()   # before the widget can steal focus
         recording = True
         audio_frames = []
     ui_queue.put("recording")
@@ -159,6 +335,7 @@ def stop_and_transcribe():
         wavfile.write(tmp_path, SAMPLE_RATE, audio_data)
         text = transcribe_audio(tmp_path)
         if text:
+            text = format_transcript(text)
             print(f"✅ {text}")
             paste_text(text)
         else:
@@ -169,18 +346,41 @@ def stop_and_transcribe():
 
 
 def audio_callback(indata, frames, time_info, status):
+    global current_level
     if recording:
         audio_frames.append(indata.copy())
+        # RMS volume for the visualizer, normalized to int16 range
+        samples = indata.astype(np.float32)
+        rms = float(np.sqrt(np.mean(samples * samples))) / 32768.0
+        with level_lock:
+            current_level = rms
 
 
 # ── Keyboard ──────────────────────────────────────────────────────────────────
 
+def _is_char(key, ch: str) -> bool:
+    """True if `key` is the given literal character (case-insensitive)."""
+    return (
+        hasattr(key, "char")
+        and key.char is not None
+        and key.char.lower() == ch.lower()
+    )
+
+
 def on_press(key):
-    global shift_down, ctrl_down
+    global shift_down, ctrl_down, recording, audio_frames
     if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
         shift_down = True
     elif key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
         ctrl_down = True
+    elif shift_down and ctrl_down and _is_char(key, "q"):
+        # Quit combo: Ctrl + Shift + Q. Cancel any in-flight recording first.
+        with lock:
+            recording = False
+            audio_frames = []
+        ui_queue.put("hide")
+        ui_queue.put("quit")
+        return False
 
     if shift_down and ctrl_down:
         start_recording()
@@ -194,9 +394,6 @@ def on_release(key):
         shift_down = False
     elif key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
         ctrl_down = False
-    elif key == keyboard.Key.esc:
-        ui_queue.put("quit")
-        return False
 
     if was_recording and (not shift_down or not ctrl_down):
         threading.Thread(target=stop_and_transcribe, daemon=True).start()
@@ -205,87 +402,115 @@ def on_release(key):
 # ── Widget ────────────────────────────────────────────────────────────────────
 
 class RecordingWidget:
-    N_BARS  = 5
-    BAR_W   = 5
-    BAR_GAP = 4
-    CVS_W   = N_BARS * BAR_W + (N_BARS - 1) * BAR_GAP
-    CVS_H   = 20
+    # Pill geometry
+    W = 104         # pill width
+    H = 34          # pill height (== 2*R → fully rounded ends)
+    R = 17          # corner radius
 
-    RED    = "#ff3b30"
-    YELLOW = "#ffd60a"
-    BG     = "#111111"
+    # Bar geometry
+    N_BARS  = 20
+    BAR_W   = 2
+    BAR_GAP = 2
+    BAR_MIN = 3
+    BAR_MAX = 22    # peak bar height
+
+    FRAME_MS = 55   # animation frame interval
+    GAIN     = 10.0 # RMS → visual level amplification (tune for your mic)
+
+    WHITE = "#ffffff"
+    FILL  = "#1a1a1a"   # pill background
 
     def __init__(self):
         self.root = tk.Tk()
+        # Must run *after* tk.Tk() so we flip the policy on Tk's own
+        # TKApplication subclass (not a bare NSApplication created by us).
+        hide_from_dock()
+
         self.root.wm_overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
-        self.root.wm_attributes("-alpha", 0.93)
-        self.root.configure(bg=self.BG)
-
-        outer = tk.Frame(self.root, bg=self.BG, padx=16, pady=9)
-        outer.pack()
+        self.root.wm_attributes("-transparent", True)
+        self.root.configure(bg="systemTransparent")
 
         self.canvas = tk.Canvas(
-            outer, width=self.CVS_W, height=self.CVS_H,
-            bg=self.BG, highlightthickness=0,
+            self.root,
+            width=self.W, height=self.H,
+            bg="systemTransparent",
+            highlightthickness=0, borderwidth=0,
         )
-        self.canvas.pack(side="left", padx=(0, 10))
+        self.canvas.pack()
 
-        self.lbl = tk.Label(
-            outer, text="Aufnahme",
-            fg="white", bg=self.BG,
-            font=("Helvetica Neue", 13, "bold"),
-        )
-        self.lbl.pack(side="left")
+        # Cached bar x-positions (centered horizontally)
+        total_w = self.N_BARS * self.BAR_W + (self.N_BARS - 1) * self.BAR_GAP
+        start_x = (self.W - total_w) // 2
+        self._bar_x = [start_x + i * (self.BAR_W + self.BAR_GAP) for i in range(self.N_BARS)]
 
+        self._draw_pill()
         self._bars: list = []
-        self._init_bars(self.RED)
-        self._tick = 0
+        self._init_bars()
         self._animating = False
+        self._history = [0.0] * self.N_BARS       # rolling bar-level buffer
 
-        # Position: bottom-center, 28 px above dock
-        self.root.update_idletasks()
+        # Position: bottom-center, 32 px above dock
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        w  = self.root.winfo_reqwidth()
-        h  = self.root.winfo_reqheight()
-        self.root.geometry(f"+{(sw - w) // 2}+{sh - h - 28}")
+        self.root.geometry(f"{self.W}x{self.H}+{(sw - self.W) // 2}+{sh - self.H - 32}")
         self.root.withdraw()
 
         self.root.after(80, self._poll)
 
-    # ── bar helpers ───────────────────────────────────────────────────────────
+    # ── drawing helpers ───────────────────────────────────────────────────────
 
-    def _init_bars(self, color: str):
-        self.canvas.delete("all")
+    def _draw_pill(self):
+        r = self.R
+        x1, y1, x2, y2 = 0, 0, self.W, self.H
+        points = [
+            x1 + r, y1,  x2 - r, y1,
+            x2,     y1,  x2,     y1 + r,
+            x2,     y2 - r, x2,  y2,
+            x2 - r, y2,  x1 + r, y2,
+            x1,     y2,  x1,     y2 - r,
+            x1,     y1 + r, x1,  y1,
+        ]
+        self.canvas.create_polygon(
+            points, smooth=True, splinesteps=36,
+            fill=self.FILL, outline="",
+        )
+
+    def _set_bar(self, bar, x, h):
+        cy = self.H / 2
+        self.canvas.coords(bar, x, cy - h / 2, x + self.BAR_W, cy + h / 2)
+
+    def _init_bars(self):
         self._bars = []
-        for i in range(self.N_BARS):
-            x = i * (self.BAR_W + self.BAR_GAP)
-            self._bars.append(
-                self.canvas.create_rectangle(
-                    x, self.CVS_H // 2,
-                    x + self.BAR_W, self.CVS_H,
-                    fill=color, outline="",
-                )
+        for x in self._bar_x:
+            bar = self.canvas.create_rectangle(
+                0, 0, 0, 0, fill=self.WHITE, outline="",
             )
+            self._set_bar(bar, x, self.BAR_MIN)
+            self._bars.append(bar)
 
-    def _reset_bars(self, color: str):
-        for i, bar in enumerate(self._bars):
-            x = i * (self.BAR_W + self.BAR_GAP)
-            self.canvas.coords(bar, x, self.CVS_H // 2, x + self.BAR_W, self.CVS_H)
-            self.canvas.itemconfig(bar, fill=color)
+    def _reset_bars(self):
+        for bar, x in zip(self._bars, self._bar_x):
+            self._set_bar(bar, x, self.BAR_MIN)
 
     # ── animation ─────────────────────────────────────────────────────────────
 
     def _animate(self):
         if not self._animating:
             return
-        self._tick += 1
-        for i, bar in enumerate(self._bars):
-            h = int(4 + 8 * abs(math.sin(self._tick * 0.3 + i * 0.9)))
-            x = i * (self.BAR_W + self.BAR_GAP)
-            self.canvas.coords(bar, x, self.CVS_H - h, x + self.BAR_W, self.CVS_H)
-        self.root.after(80, self._animate)
+        span = self.BAR_MAX - self.BAR_MIN
+
+        with level_lock:
+            rms = current_level
+        # amplify + sqrt-compress for visual dynamic range, clip to [0, 1]
+        level = min(1.0, math.sqrt(max(0.0, rms) * self.GAIN))
+        # shift history left, newest value enters on the right
+        self._history = self._history[1:] + [level]
+        for i, (bar, x) in enumerate(zip(self._bars, self._bar_x)):
+            h = self.BAR_MIN + span * self._history[i]
+            self._set_bar(bar, x, h)
+
+        self.root.after(self.FRAME_MS, self._animate)
 
     # ── queue poll ────────────────────────────────────────────────────────────
 
@@ -294,15 +519,15 @@ class RecordingWidget:
             while True:
                 msg = ui_queue.get_nowait()
                 if msg == "recording":
-                    self._reset_bars(self.RED)
-                    self.lbl.config(text="Aufnahme", fg="white")
+                    self._reset_bars()
+                    self._history = [0.0] * self.N_BARS
                     self._animating = True
                     self.root.deiconify()
                     self._animate()
                 elif msg == "transcribing":
+                    # freeze bars at idle while the API call runs
                     self._animating = False
-                    self._reset_bars(self.YELLOW)
-                    self.lbl.config(text="Transkribiere…", fg=self.YELLOW)
+                    self._reset_bars()
                 elif msg == "hide":
                     self._animating = False
                     self.root.withdraw()
@@ -326,7 +551,7 @@ if __name__ == "__main__":
 
     print("🎤 Voice Dictate — Mistral Voxtral Mini")
     print("Shortcut: Ctrl + Shift (hold → release = transcribe)")
-    print("ESC to quit\n")
+    print("Ctrl + Shift + Q to quit\n")
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
