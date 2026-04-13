@@ -1,4 +1,4 @@
-# Voice Dictate
+# Vozito
 
 A lightweight macOS dictation tool that runs in the background. Hold a keyboard shortcut, speak, release — your transcribed text is pasted into whatever app you're using.
 
@@ -31,8 +31,8 @@ Quit with `Ctrl + Shift + Q`.
 ### 1. Clone & install dependencies
 
 ```bash
-git clone https://github.com/your-user/voice-dictate.git
-cd voice-dictate
+git clone https://github.com/wcmrg77/Vozito.git
+cd Vozito
 pip3.13 install -r requirements.txt
 pip3.13 install pyobjc-framework-Cocoa
 ```
@@ -55,14 +55,14 @@ If it runs without errors, you're ready to set up auto-start.
 
 ### 4. Auto-start on login (launchd)
 
-This sets up voice-dictate as a background service that starts on login and auto-restarts on crash.
+This sets up Vozito as a background service that starts on login and auto-restarts on crash.
 
 ```bash
 # Copy the example plist
-cp launchd/com.voice-dictate.plist.example ~/Library/LaunchAgents/com.voice-dictate.plist
+cp launchd/com.voice-dictate.plist.example ~/Library/LaunchAgents/com.vozito.plist
 ```
 
-Edit `~/Library/LaunchAgents/com.voice-dictate.plist` and replace the placeholder paths with your actual paths:
+Edit `~/Library/LaunchAgents/com.vozito.plist` and replace the placeholder paths with your actual paths:
 
 - `/path/to/python3.13` → your Python path (run `which python3.13` to find it)
 - `/path/to/voice-dictate` → the directory where you cloned the repo
@@ -70,7 +70,7 @@ Edit `~/Library/LaunchAgents/com.voice-dictate.plist` and replace the placeholde
 Then load the service:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.voice-dictate.plist
+launchctl load ~/Library/LaunchAgents/com.vozito.plist
 ```
 
 The tool is now running and will auto-start on every login.
@@ -79,10 +79,10 @@ The tool is now running and will auto-start on every login.
 
 ```bash
 # Restart
-launchctl kickstart -k gui/$(id -u)/com.voice-dictate
+launchctl kickstart -k gui/$(id -u)/com.vozito
 
 # Stop
-launchctl unload ~/Library/LaunchAgents/com.voice-dictate.plist
+launchctl unload ~/Library/LaunchAgents/com.vozito.plist
 
 # View logs
 tail -f /tmp/voice-dictate.out
@@ -112,7 +112,7 @@ Edit the constants at the top of `voice_dictate.py`:
 
 ## Windows Support
 
-Voice Dictate is currently **macOS only**. Porting to Windows would require changes in these areas:
+Vozito is currently **macOS only**. Porting to Windows would require changes in these areas:
 
 | Area | macOS (current) | Windows equivalent |
 |---|---|---|
