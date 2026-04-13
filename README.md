@@ -3,7 +3,7 @@
 A lightweight macOS dictation tool that runs in the background. Hold a keyboard shortcut, speak, release — your transcribed text is pasted into whatever app you're using.
 
 - **Transcription:** Mistral Voxtral Mini (via Mistral API)
-- **Post-processing:** Automatic paragraph formatting for emails/messages (Ministral 3B)
+- **Post-processing:** Cleans up filler words, duplications, spelling — formats emails with paragraph breaks (Mistral Small)
 - **UI:** Minimal floating pill with live waveform animation
 - **Platform:** macOS only (uses AppKit, tkinter, launchd)
 
@@ -104,9 +104,9 @@ Edit the constants at the top of `voice_dictate.py`:
 
 | Setting | Default | Description |
 |---|---|---|
-| `FORMAT_ENABLED` | `True` | Auto-format emails/messages with paragraph breaks |
-| `FORMAT_MODEL` | `ministral-3b-latest` | LLM model for formatting |
-| `FORMAT_TIMEOUT` | `2.0` | Timeout (seconds) for formatting — falls back to raw text |
+| `FORMAT_ENABLED` | `True` | Clean up dictation (filler words, spelling, email formatting) |
+| `FORMAT_MODEL` | `mistral-small-latest` | LLM model for post-processing |
+| `FORMAT_TIMEOUT` | `4.0` | Timeout (seconds) for formatting — falls back to raw text |
 | `SAMPLE_RATE` | `16000` | Audio sample rate |
 | `DISCO` | `True` | Rainbow waveform bars — each bar cycles through the color spectrum while recording |
 
