@@ -110,6 +110,21 @@ Edit the constants at the top of `voice_dictate.py`:
 | `SAMPLE_RATE` | `16000` | Audio sample rate |
 | `DISCO` | `True` | Rainbow waveform bars — each bar cycles through the color spectrum while recording |
 
+## Windows Support
+
+Voice Dictate is currently **macOS only**. Porting to Windows would require changes in these areas:
+
+| Area | macOS (current) | Windows equivalent |
+|---|---|---|
+| Hide from Dock/Alt-Tab | AppKit activation policy | `pywin32` with `WS_EX_TOOLWINDOW` |
+| Detect foreground window | `NSWorkspace` | `win32gui.GetForegroundWindow()` |
+| Refocus window after paste | `NSRunningApplication` | `win32gui.SetForegroundWindow()` |
+| Transparent overlay | `-transparent` / `systemTransparent` | `-transparentcolor` with chroma key |
+| Keystroke simulation | `osascript` (AppleScript) | `pynput.keyboard.Controller` |
+| Auto-start on login | launchd plist | Task Scheduler or Startup folder |
+
+Contributions welcome — a `platform_utils.py` with `sys.platform` branches would be the cleanest approach.
+
 ## License
 
 MIT
