@@ -24,6 +24,7 @@ except ImportError:
     print("❌ tkinter not found. Install with: brew install python-tk@3.13")
     sys.exit(1)
 
+import colorsys
 import numpy as np
 import scipy.io.wavfile as wavfile
 import sounddevice as sd
@@ -419,6 +420,7 @@ class RecordingWidget:
 
     WHITE = "#ffffff"
     FILL  = "#1a1a1a"   # pill background
+    DISCO = True         # rainbow bar colors
 
     def __init__(self):
         self.root = tk.Tk()
@@ -449,6 +451,7 @@ class RecordingWidget:
         self._init_bars()
         self._animating = False
         self._history = [0.0] * self.N_BARS       # rolling bar-level buffer
+        self._disco_tick = 0                       # frame counter for hue rotation
 
         # Position: bottom-center, 32 px above dock
         sw = self.root.winfo_screenwidth()
@@ -497,10 +500,18 @@ class RecordingWidget:
             self._bars.append(bar)
 
     def _reset_bars(self):
+        self._disco_tick = 0
         for bar, x in zip(self._bars, self._bar_x):
             self._set_bar(bar, x, self.BAR_MIN)
+            self.canvas.itemconfigure(bar, fill=self.WHITE)
 
     # ── animation ─────────────────────────────────────────────────────────────
+
+    def _disco_color(self, bar_index: int) -> str:
+        """Return a bright rainbow hex color cycling per bar and frame."""
+        hue = ((bar_index / self.N_BARS) + (self._disco_tick * 0.04)) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.9, 1.0)
+        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
 
     def _animate(self):
         if not self._animating:
@@ -513,9 +524,12 @@ class RecordingWidget:
         level = min(1.0, math.sqrt(max(0.0, rms) * self.GAIN))
         # shift history left, newest value enters on the right
         self._history = self._history[1:] + [level]
+        self._disco_tick += 1
         for i, (bar, x) in enumerate(zip(self._bars, self._bar_x)):
             h = self.BAR_MIN + span * self._history[i]
             self._set_bar(bar, x, h)
+            if self.DISCO:
+                self.canvas.itemconfigure(bar, fill=self._disco_color(i))
 
         self.root.after(self.FRAME_MS, self._animate)
 
